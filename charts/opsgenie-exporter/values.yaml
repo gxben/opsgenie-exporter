@@ -1,0 +1,147 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/gxben/opsgenie-exporter
+  pullPolicy: IfNotPresent
+  # Overrides the image tag; defaults to the chart's appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# OpsGenie API configuration
+opsgenie:
+  # Provide apiKey directly (stored in a Secret created by this chart).
+  # Prefer existingSecret when managing secrets externally (e.g. External Secrets Operator).
+  apiKey: ""
+
+  # Use a pre-existing Secret instead of creating one.
+  # The Secret must contain the key "api-key".
+  existingSecret: ""
+  existingSecretKey: "api-key"
+
+  # OpsGenie API URL. Leave empty to use the default (US: api.opsgenie.com).
+  # Set to api.eu.opsgenie.com for EU tenants.
+  apiURL: ""
+
+  # Timeout for each OpsGenie API scrape
+  scrapeTimeout: "60s"
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9428"
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 9428
+  annotations: {}
+
+# Prometheus Operator ServiceMonitor
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: "120s"
+  scrapeTimeout: "90s"
+  labels: {}
+  relabelings: []
+  metricRelabelings: []
+
+# Prometheus Operator PrometheusRule
+prometheusRule:
+  enabled: false
+  namespace: ""
+  labels: {}
+  additionalLabels: {}
+  rules:
+    - alert: OpsGenieExporterDown
+      expr: opsgenie_scrape_success == 0
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "OpsGenie exporter scrape failed"
+        description: "The OpsGenie exporter could not reach the API."
+    - alert: OpsGenieHeartbeatExpired
+      expr: opsgenie_heartbeat_expired == 1
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "OpsGenie heartbeat {{ $labels.name }} has expired"
+        description: "Heartbeat {{ $labels.name }} has not pinged within its configured interval."
+    - alert: OpsGenieHighPriorityAlerts
+      expr: sum(opsgenie_alerts_total{status="open", priority=~"P1|P2"}) > 0
+      for: 0m
+      labels:
+        severity: warning
+      annotations:
+        summary: "{{ $value }} high-priority OpsGenie alert(s) are open"
+        description: "There are P1/P2 alerts currently open in OpsGenie."
+    - alert: OpsGenieNoOnCallUser
+      expr: count(opsgenie_oncall_info) by (schedule_name) == 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "No user on call for schedule {{ $labels.schedule_name }}"
+        description: "OpsGenie schedule {{ $labels.schedule_name }} has no on-call participant."
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: opsgenie-exporter.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 64Mi
+  requests:
+    cpu: 10m
+    memory: 32Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra environment variables injected into the container
+extraEnv: []
+# - name: FOO
+#   value: bar
+
+# Extra volumes / mounts
+extraVolumes: []
+extraVolumeMounts: []

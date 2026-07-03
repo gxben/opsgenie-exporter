@@ -1,0 +1,24 @@
+apiVersion: v2
+name: opsgenie-exporter
+description: Prometheus exporter for OpsGenie — alerts, on-call schedules, heartbeats, teams, users, and incidents
+type: application
+version: 0.1.0
+appVersion: "0.0.0"
+keywords:
+  - prometheus
+  - exporter
+  - opsgenie
+  - oncall
+  - monitoring
+  - alerting
+home: https://github.com/gxben/opsgenie-exporter
+sources:
+  - https://github.com/gxben/opsgenie-exporter
+maintainers:
+  - name: Benjamin Zores
+    email: bzores@cinemo.com
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/changes: |
+    - kind: added
+      description: Initial release
