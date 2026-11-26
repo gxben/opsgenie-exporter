@@ -27,7 +27,7 @@ go test ./internal/collector/... -run TestFoo -v
 
 **Entry point** (`main.go`): parses flags, constructs one SDK client per OpsGenie service (`alert`, `schedule`, `heartbeat`, `team`, `user`, `incident`), calls `cfg.ConfigureLogLevel("error")` to suppress SDK logrus noise, then registers the collector with a fresh Prometheus registry and serves `/metrics` + `/healthz`.
 
-**Collector** (`internal/collector/collector.go`): a single `Collector` struct that holds all six SDK clients and every `*prometheus.Desc`. `Collect()` calls six private methods in sequence — each one can fail independently without aborting the others (errors are joined and logged as warnings). Scrape success/duration meta-metrics are always emitted.
+**Collector** (`internal/collector/collector.go`): a single `Collector` struct that holds all six SDK clients and every `*prometheus.Desc`. `Run()` polls in the background every `--opsgenie.poll-interval`: `Poll()` runs six sub-collectors in sequence and caches their metrics per sub-collector; `Collect()` only serves that cache and never calls the API. A failed sub-collector keeps its previous metrics (`opsgenie_collector_success` 0, `opsgenie_collector_last_success_timestamp_seconds` unchanged). Poll success/duration meta-metrics are always emitted.
 
 ### OpsGenie SDK quirks to keep in mind
 
@@ -36,6 +36,9 @@ go test ./internal/collector/... -run TestFoo -v
 - OpsGenie has no `status:acknowledged` query value. Acknowledged alerts remain `status:open`; use `status:open AND acknowledged:true` to count them.
 - `cfg.ConfigureLogLevel("error")` is required — without it the SDK emits logrus `WARN Could not set requestId` on every response.
 - API FQDN only (no scheme): `api.opsgenie.com` (US default) or `api.eu.opsgenie.com` (EU). Set via `--opsgenie.api-url` flag or omit for US.
+- The SDK retries HTTP 429 four times by default: `collector.RetryPolicy` (set in `main.go`) drops 429 from the retries, and a sub-collector stops at its first 429 (`errThrottled`) until the next poll.
+- `client.Exec` calls `req.WithContext(ctx)` without using the result: the context never reaches the HTTP request. Poll timeouts are enforced between calls (`Collector.pause`, `ctx.Err()` checks) and per attempt with `Config.RequestTimeout`.
+- `user.ListRequest.ResourcePath()` is `/v2/users/` (trailing slash) — matters for the fake API in `collector_test.go`.
 
 ### CI / release pipeline
 

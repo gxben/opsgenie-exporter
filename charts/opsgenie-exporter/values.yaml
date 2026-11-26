@@ -25,8 +25,16 @@ opsgenie:
   # Set to api.eu.opsgenie.com for EU tenants.
   apiURL: ""
 
-  # Timeout for each OpsGenie API scrape
+  # Timeout for one OpsGenie API poll
   scrapeTimeout: "60s"
+
+  # How often the OpsGenie API is polled. /metrics serves the last poll, so
+  # the scrape interval doesn't drive the API load.
+  pollInterval: "5m"
+
+  # Pause between consecutive API calls of a poll (one per schedule, one per
+  # alert priority), to stay under the OpsGenie rate limits
+  requestInterval: "1s"
 
 serviceAccount:
   create: true
@@ -62,8 +70,8 @@ service:
 serviceMonitor:
   enabled: false
   namespace: ""
-  interval: "120s"
-  scrapeTimeout: "90s"
+  interval: "60s"
+  scrapeTimeout: "10s"
   labels: {}
   relabelings: []
   metricRelabelings: []

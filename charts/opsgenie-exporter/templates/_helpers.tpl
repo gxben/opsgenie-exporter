@@ -77,6 +77,6 @@ Secret key holding the API key.
 {{- if .Values.opsgenie.existingSecret }}
 {{- .Values.opsgenie.existingSecretKey }}
 {{- else }}
-api-key
+{{- "api-key" }}
 {{- end }}
 {{- end }}

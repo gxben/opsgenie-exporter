@@ -62,10 +62,17 @@ count(opsgenie_oncall_info) by (schedule_name) == 0
 
 | Metric | Type | Description |
 |---|---|---|
-| `opsgenie_scrape_duration_seconds` | Gauge | Wall time for the full API scrape |
-| `opsgenie_scrape_success` | Gauge | 1 if all sub-collectors completed without errors |
+| `opsgenie_scrape_duration_seconds` | Gauge | Wall time of the last API poll |
+| `opsgenie_scrape_success` | Gauge | 1 if all sub-collectors completed without errors in the last poll |
+| `opsgenie_collector_success` | Gauge | 1 if the sub-collector (`collector` label) completed without errors in the last poll |
+| `opsgenie_collector_last_success_timestamp_seconds` | Gauge | Unix time of the sub-collector's last successful poll |
+| `opsgenie_api_throttled_total` | Counter | Polls a sub-collector stopped because OpsGenie answered HTTP 429 |
 
-Each sub-collector (alerts, on-call, heartbeats, teams, users, incidents) fails independently — a single API error does not zero-out the other metrics; `opsgenie_scrape_success` is set to 0 only when at least one sub-collector fails.
+The exporter polls the OpsGenie API in the background every `--opsgenie.poll-interval`; a scrape of `/metrics` only serves the last poll and never calls the API, so the scrape interval doesn't drive the API load and polls never overlap.
+
+Each sub-collector (alerts, on-call, heartbeats, teams, users, incidents) fails independently — a failed sub-collector keeps serving its previous values (watch `opsgenie_collector_last_success_timestamp_seconds` for staleness); `opsgenie_scrape_success` is set to 0 only when at least one sub-collector fails.
+
+Rate limits: an HTTP 429 is not retried (the OpsGenie SDK retries it four times by default). The sub-collector stops at the first 429 and is retried at the next poll, instead of spending the rate limit on retries.
 
 ---
 
@@ -98,7 +105,9 @@ All flags:
 |---|---|---|
 | `--opsgenie.api-key` | — | API key (`OPSGENIE_API_KEY` env var as fallback) |
 | `--opsgenie.api-url` | `api.opsgenie.com` | API FQDN — use `api.eu.opsgenie.com` for EU tenants |
-| `--opsgenie.scrape-timeout` | `60s` | Timeout for a full API scrape |
+| `--opsgenie.scrape-timeout` | `60s` | Timeout for one API poll |
+| `--opsgenie.poll-interval` | `5m` | How often the API is polled; `/metrics` serves the last poll |
+| `--opsgenie.request-interval` | `1s` | Pause between consecutive API calls of a poll (one per schedule, one per alert priority) |
 | `--web.listen-address` | `:9428` | Address to expose metrics on |
 | `--web.telemetry-path` | `/metrics` | Path to expose metrics at |
 | `--version` | — | Print version and exit |
@@ -176,10 +185,12 @@ Key chart values:
 | `opsgenie.apiKey` | `""` | API key (stored in a chart-managed Secret) |
 | `opsgenie.existingSecret` | `""` | Use a pre-existing Secret instead |
 | `opsgenie.apiURL` | `""` | API FQDN; empty = `api.opsgenie.com` (US) |
-| `opsgenie.scrapeTimeout` | `"60s"` | Scrape timeout passed to the exporter |
+| `opsgenie.scrapeTimeout` | `"60s"` | Poll timeout passed to the exporter |
+| `opsgenie.pollInterval` | `"5m"` | API poll interval passed to the exporter |
+| `opsgenie.requestInterval` | `"1s"` | Pause between consecutive API calls of a poll |
 | `serviceMonitor.enabled` | `false` | Create a Prometheus Operator `ServiceMonitor` |
 | `prometheusRule.enabled` | `false` | Create a Prometheus Operator `PrometheusRule` |
-| `serviceMonitor.interval` | `"120s"` | Prometheus scrape interval |
+| `serviceMonitor.interval` | `"60s"` | Prometheus scrape interval |
 
 ---
 
