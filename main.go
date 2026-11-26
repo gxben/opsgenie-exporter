@@ -15,6 +15,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -43,7 +44,9 @@ func main() {
 		metricsPath   = flag.String("web.telemetry-path", "/metrics", "Path under which to expose metrics")
 		apiKey        = flag.String("opsgenie.api-key", "", "OpsGenie API key (or set OPSGENIE_API_KEY env var)")
 		apiURL        = flag.String("opsgenie.api-url", "", `OpsGenie API URL (default: api.opsgenie.com; EU: api.eu.opsgenie.com)`)
-		scrapeTimeout = flag.Duration("opsgenie.scrape-timeout", 60*time.Second, "Timeout for a single OpsGenie API scrape")
+		scrapeTimeout = flag.Duration("opsgenie.scrape-timeout", 60*time.Second, "Timeout for one OpsGenie API poll")
+		pollInterval  = flag.Duration("opsgenie.poll-interval", 5*time.Minute, "How often the OpsGenie API is polled; /metrics serves the last poll")
+		reqInterval   = flag.Duration("opsgenie.request-interval", time.Second, "Pause between consecutive OpsGenie API calls of a poll (one per schedule, one per alert priority)")
 		showVersion   = flag.Bool("version", false, "Print version and exit")
 	)
 	flag.Parse()
@@ -63,7 +66,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	cfg := &client.Config{ApiKey: key}
+	cfg := &client.Config{
+		ApiKey: key,
+		// HTTP 429 is not retried: the collector skips the rest of the
+		// sub-collector until the next poll.
+		RetryPolicy: collector.RetryPolicy,
+		// The SDK doesn't pass the context to its HTTP requests: bound each
+		// attempt instead.
+		RequestTimeout: 15 * time.Second,
+	}
 	// Suppress internal SDK logrus chatter (e.g. "Could not set requestId").
 	cfg.ConfigureLogLevel("error")
 	if *apiURL != "" {
@@ -108,7 +119,8 @@ func main() {
 		Team:      teamCli,
 		User:      userCli,
 		Incident:  incidentCli,
-	}, *scrapeTimeout)
+	}, *scrapeTimeout, *reqInterval)
+	go coll.Run(context.Background(), *pollInterval)
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(coll)
@@ -136,13 +148,14 @@ func main() {
 		"version", version,
 		"listen", *listenAddr,
 		"metrics_path", *metricsPath,
+		"poll_interval", *pollInterval,
 	)
 
 	server := &http.Server{
 		Addr:         *listenAddr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
-		WriteTimeout: *scrapeTimeout + 10*time.Second,
+		WriteTimeout: 10 * time.Second, // /metrics serves the last poll, no API call
 		IdleTimeout:  120 * time.Second,
 	}
 

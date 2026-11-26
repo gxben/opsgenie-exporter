@@ -36,6 +36,8 @@ spec:
           args:
             - --web.listen-address=:{{ .Values.service.port }}
             - --opsgenie.scrape-timeout={{ .Values.opsgenie.scrapeTimeout }}
+            - --opsgenie.poll-interval={{ .Values.opsgenie.pollInterval }}
+            - --opsgenie.request-interval={{ .Values.opsgenie.requestInterval }}
             {{- if .Values.opsgenie.apiURL }}
             - --opsgenie.api-url={{ .Values.opsgenie.apiURL }}
             {{- end }}

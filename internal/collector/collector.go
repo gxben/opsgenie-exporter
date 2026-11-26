@@ -19,9 +19,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"sync"
 	"time"
 
 	ogalert "github.com/opsgenie/opsgenie-go-sdk-v2/alert"
+	"github.com/opsgenie/opsgenie-go-sdk-v2/client"
 	ogheartbeat "github.com/opsgenie/opsgenie-go-sdk-v2/heartbeat"
 	ogincident "github.com/opsgenie/opsgenie-go-sdk-v2/incident"
 	ogschedule "github.com/opsgenie/opsgenie-go-sdk-v2/schedule"
@@ -45,10 +48,37 @@ type Clients struct {
 	Incident  *ogincident.Client
 }
 
-// Collector implements prometheus.Collector backed by the OpsGenie SDK.
+// errThrottled reports that OpsGenie answered HTTP 429: the rest of the
+// sub-collector is skipped until the next poll.
+var errThrottled = errors.New("rate limited by OpsGenie (HTTP 429)")
+
+// subCollector is one group of OpsGenie API calls (on-call, alerts, …).
+type subCollector struct {
+	name    string
+	collect func(context.Context, chan<- prometheus.Metric) error
+}
+
+// subCollectorState is the last poll outcome of a sub-collector. metrics keeps
+// the last successful result: a failed poll doesn't blank the dashboards.
+type subCollectorState struct {
+	metrics     []prometheus.Metric
+	success     float64
+	lastSuccess time.Time
+	throttled   float64
+}
+
+// Collector implements prometheus.Collector backed by the OpsGenie SDK. Run
+// polls the API in the background; Collect only serves the last poll, so a
+// scrape never calls OpsGenie.
 type Collector struct {
-	clients Clients
-	timeout time.Duration
+	clients         Clients
+	timeout         time.Duration
+	requestInterval time.Duration
+
+	mu           sync.RWMutex
+	states       map[string]*subCollectorState
+	pollDuration float64
+	pollSuccess  float64
 
 	// on-call metrics
 	oncallInfo *prometheus.Desc
@@ -73,19 +103,26 @@ type Collector struct {
 	incidentInfo   *prometheus.Desc
 
 	// scrape meta
-	scrapeDuration *prometheus.Desc
-	scrapeSuccess  *prometheus.Desc
+	scrapeDuration       *prometheus.Desc
+	scrapeSuccess        *prometheus.Desc
+	collectorSuccess     *prometheus.Desc
+	collectorLastSuccess *prometheus.Desc
+	apiThrottled         *prometheus.Desc
 }
 
 // New returns a Collector ready to register with a Prometheus registry.
-func New(clients Clients, timeout time.Duration) *Collector {
+// timeout bounds one poll; requestInterval spaces the consecutive calls of a
+// sub-collector (one per schedule, one per alert priority).
+func New(clients Clients, timeout, requestInterval time.Duration) *Collector {
 	desc := func(subsystem, name, help string, labels []string) *prometheus.Desc {
 		return prometheus.NewDesc(prometheus.BuildFQName(namespace, subsystem, name), help, labels, nil)
 	}
 
-	return &Collector{
-		clients: clients,
-		timeout: timeout,
+	c := &Collector{
+		clients:         clients,
+		timeout:         timeout,
+		requestInterval: requestInterval,
+		states:          make(map[string]*subCollectorState),
 
 		oncallInfo: desc("oncall", "info",
 			"Info metric — 1 per participant currently on call per schedule. Join on schedule_id or user_name for alerting.",
@@ -135,12 +172,84 @@ func New(clients Clients, timeout time.Duration) *Collector {
 
 		scrapeDuration: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "scrape", "duration_seconds"),
-			"Total time spent fetching data from the OpsGenie API.", nil, nil,
+			"Total time spent fetching data from the OpsGenie API in the last poll.", nil, nil,
 		),
 		scrapeSuccess: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "scrape", "success"),
-			"1 if the last scrape completed without errors.", nil, nil,
+			"1 if the last poll completed without errors.", nil, nil,
 		),
+		collectorSuccess: desc("collector", "success",
+			"1 if the sub-collector's last poll completed without errors (on failure its previous metrics are served).",
+			[]string{"collector"},
+		),
+		collectorLastSuccess: desc("collector", "last_success_timestamp_seconds",
+			"Unix time of the sub-collector's last successful poll.",
+			[]string{"collector"},
+		),
+		apiThrottled: desc("api", "throttled_total",
+			"Number of polls a sub-collector stopped because OpsGenie answered HTTP 429.",
+			[]string{"collector"},
+		),
+	}
+	for _, sc := range c.subCollectors() {
+		c.states[sc.name] = &subCollectorState{}
+	}
+
+	return c
+}
+
+func (c *Collector) subCollectors() []subCollector {
+	return []subCollector{
+		{"oncall", c.collectOnCall},
+		{"alerts", c.collectAlerts},
+		{"heartbeats", c.collectHeartbeats},
+		{"teams", c.collectTeams},
+		{"users", c.collectUsers},
+		{"incidents", c.collectIncidents},
+	}
+}
+
+// RetryPolicy is the SDK's default retry policy minus HTTP 429: a throttled
+// call returns at once and the sub-collector stops until the next poll,
+// instead of spending the rate limit on retries (the SDK retries 429 four
+// times by default).
+func RetryPolicy(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	if err != nil {
+		return true, err
+	}
+	return resp.StatusCode == 0 || (resp.StatusCode >= 500 && resp.StatusCode != 501), nil
+}
+
+func isThrottled(err error) bool {
+	var apiErr *client.ApiError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests
+}
+
+// wrapThrottled turns an HTTP 429 from the SDK into errThrottled.
+func wrapThrottled(err error) error {
+	if isThrottled(err) {
+		return errThrottled
+	}
+	return err
+}
+
+// pause waits requestInterval before the next call of a sub-collector. The SDK
+// doesn't attach the context to its HTTP requests, so this is also where the
+// poll timeout takes effect.
+func (c *Collector) pause(ctx context.Context) error {
+	if c.requestInterval <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(c.requestInterval)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
 	}
 }
 
@@ -158,59 +267,97 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.incidentInfo
 	ch <- c.scrapeDuration
 	ch <- c.scrapeSuccess
+	ch <- c.collectorSuccess
+	ch <- c.collectorLastSuccess
+	ch <- c.apiThrottled
 }
 
-// Collect implements prometheus.Collector.
+// Collect implements prometheus.Collector. It serves the last poll and never
+// calls the OpsGenie API.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	for _, sc := range c.subCollectors() {
+		st := c.states[sc.name]
+		for _, m := range st.metrics {
+			ch <- m
+		}
+		ch <- prometheus.MustNewConstMetric(c.collectorSuccess, prometheus.GaugeValue, st.success, sc.name)
+		ch <- prometheus.MustNewConstMetric(c.apiThrottled, prometheus.CounterValue, st.throttled, sc.name)
+		if !st.lastSuccess.IsZero() {
+			ch <- prometheus.MustNewConstMetric(c.collectorLastSuccess, prometheus.GaugeValue, float64(st.lastSuccess.Unix()), sc.name)
+		}
+	}
+
+	ch <- prometheus.MustNewConstMetric(c.scrapeDuration, prometheus.GaugeValue, c.pollDuration)
+	ch <- prometheus.MustNewConstMetric(c.scrapeSuccess, prometheus.GaugeValue, c.pollSuccess)
+}
+
+// Run polls OpsGenie right away, then every interval until ctx is cancelled.
+// Polls never overlap: a poll longer than interval delays the next one.
+func (c *Collector) Run(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		c.Poll(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// Poll runs every sub-collector once and stores the result for Collect.
+func (c *Collector) Poll(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
 	start := time.Now()
 	success := 1.0
 
-	if err := c.collect(ch); err != nil {
-		slog.Error("scrape failed", "err", err)
-		success = 0
+	for _, sc := range c.subCollectors() {
+		metrics, err := gather(ctx, sc.collect)
+
+		c.mu.Lock()
+		st := c.states[sc.name]
+		if err != nil {
+			success = 0
+			st.success = 0
+			if errors.Is(err, errThrottled) {
+				st.throttled++
+			}
+			slog.Warn("collection failed, serving the previous values", "collector", sc.name, "err", err)
+		} else {
+			st.metrics = metrics
+			st.success = 1
+			st.lastSuccess = time.Now()
+		}
+		c.mu.Unlock()
 	}
 
-	ch <- prometheus.MustNewConstMetric(c.scrapeDuration, prometheus.GaugeValue, time.Since(start).Seconds())
-	ch <- prometheus.MustNewConstMetric(c.scrapeSuccess, prometheus.GaugeValue, success)
+	c.mu.Lock()
+	c.pollDuration = time.Since(start).Seconds()
+	c.pollSuccess = success
+	c.mu.Unlock()
 }
 
-func (c *Collector) collect(ch chan<- prometheus.Metric) error {
-	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
-	defer cancel()
+// gather runs one sub-collector and returns the metrics it emitted.
+func gather(ctx context.Context, collect func(context.Context, chan<- prometheus.Metric) error) ([]prometheus.Metric, error) {
+	ch := make(chan prometheus.Metric)
+	var err error
+	go func() {
+		err = collect(ctx, ch)
+		close(ch)
+	}()
 
-	var errs []error
-
-	if err := c.collectOnCall(ctx, ch); err != nil {
-		slog.Warn("on-call collection partial failure", "err", err)
-		errs = append(errs, fmt.Errorf("oncall: %w", err))
+	var metrics []prometheus.Metric
+	for m := range ch {
+		metrics = append(metrics, m)
 	}
-
-	if err := c.collectAlerts(ctx, ch); err != nil {
-		slog.Warn("alert collection partial failure", "err", err)
-		errs = append(errs, fmt.Errorf("alerts: %w", err))
-	}
-
-	if err := c.collectHeartbeats(ctx, ch); err != nil {
-		slog.Warn("heartbeat collection partial failure", "err", err)
-		errs = append(errs, fmt.Errorf("heartbeats: %w", err))
-	}
-
-	if err := c.collectTeams(ctx, ch); err != nil {
-		slog.Warn("team collection partial failure", "err", err)
-		errs = append(errs, fmt.Errorf("teams: %w", err))
-	}
-
-	if err := c.collectUsers(ctx, ch); err != nil {
-		slog.Warn("user collection partial failure", "err", err)
-		errs = append(errs, fmt.Errorf("users: %w", err))
-	}
-
-	if err := c.collectIncidents(ctx, ch); err != nil {
-		slog.Warn("incident collection partial failure", "err", err)
-		errs = append(errs, fmt.Errorf("incidents: %w", err))
-	}
-
-	return errors.Join(errs...)
+	return metrics, err
 }
 
 // ─── On-call ──────────────────────────────────────────────────────────────────
@@ -219,16 +366,22 @@ func (c *Collector) collectOnCall(ctx context.Context, ch chan<- prometheus.Metr
 	expandFalse := false
 	schedules, err := c.clients.Schedule.List(ctx, &ogschedule.ListRequest{Expand: &expandFalse})
 	if err != nil {
-		return fmt.Errorf("listing schedules: %w", err)
+		return fmt.Errorf("listing schedules: %w", wrapThrottled(err))
 	}
 
 	flat := false // false → API returns OnCallParticipants (structured); true → OnCallRecipients ([]string only)
 	for _, sched := range schedules.Schedule {
+		if err := c.pause(ctx); err != nil {
+			return err
+		}
 		onCalls, err := c.clients.Schedule.GetOnCalls(ctx, &ogschedule.GetOnCallsRequest{
 			ScheduleIdentifierType: ogschedule.Id,
 			ScheduleIdentifier:     sched.Id,
 			Flat:                   &flat,
 		})
+		if isThrottled(err) {
+			return fmt.Errorf("getting on-call for schedule %s: %w", sched.Name, errThrottled)
+		}
 		if err != nil {
 			slog.Warn("failed to get on-call", "schedule", sched.Name, "err", err)
 			continue
@@ -268,9 +421,15 @@ func (c *Collector) collectAlerts(ctx context.Context, ch chan<- prometheus.Metr
 	}
 	for status, baseQuery := range queries {
 		for _, priority := range []string{"P1", "P2", "P3", "P4", "P5"} {
+			if err := c.pause(ctx); err != nil {
+				return err
+			}
 			result, err := c.clients.Alert.CountAlerts(ctx, &ogalert.CountAlertsRequest{
 				Query: fmt.Sprintf("%s AND priority:%s", baseQuery, priority),
 			})
+			if isThrottled(err) {
+				return fmt.Errorf("counting %s %s alerts: %w", status, priority, errThrottled)
+			}
 			if err != nil {
 				slog.Warn("failed to count alerts", "status", status, "priority", priority, "err", err)
 				continue
@@ -291,7 +450,7 @@ func (c *Collector) collectAlerts(ctx context.Context, ch chan<- prometheus.Metr
 func (c *Collector) collectHeartbeats(ctx context.Context, ch chan<- prometheus.Metric) error {
 	result, err := c.clients.Heartbeat.List(ctx)
 	if err != nil {
-		return fmt.Errorf("listing heartbeats: %w", err)
+		return fmt.Errorf("listing heartbeats: %w", wrapThrottled(err))
 	}
 
 	boolVal := func(b bool) float64 {
@@ -314,7 +473,7 @@ func (c *Collector) collectHeartbeats(ctx context.Context, ch chan<- prometheus.
 func (c *Collector) collectTeams(ctx context.Context, ch chan<- prometheus.Metric) error {
 	result, err := c.clients.Team.List(ctx, &ogteam.ListTeamRequest{})
 	if err != nil {
-		return fmt.Errorf("listing teams: %w", err)
+		return fmt.Errorf("listing teams: %w", wrapThrottled(err))
 	}
 
 	ch <- prometheus.MustNewConstMetric(c.teamsTotal, prometheus.GaugeValue, float64(len(result.Teams)))
@@ -333,12 +492,15 @@ func (c *Collector) collectUsers(ctx context.Context, ch chan<- prometheus.Metri
 
 	offset := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		result, err := c.clients.User.List(ctx, &oguser.ListRequest{
 			Limit:  pageSize,
 			Offset: offset,
 		})
 		if err != nil {
-			return fmt.Errorf("listing users at offset %d: %w", offset, err)
+			return fmt.Errorf("listing users at offset %d: %w", offset, wrapThrottled(err))
 		}
 
 		for _, u := range result.Users {
@@ -376,13 +538,16 @@ func (c *Collector) collectIncidents(ctx context.Context, ch chan<- prometheus.M
 
 	offset := 0
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		result, err := c.clients.Incident.List(ctx, &ogincident.ListRequest{
 			Query:  "status:open OR status:acknowledged",
 			Limit:  pageSize,
 			Offset: offset,
 		})
 		if err != nil {
-			return fmt.Errorf("listing incidents at offset %d: %w", offset, err)
+			return fmt.Errorf("listing incidents at offset %d: %w", offset, wrapThrottled(err))
 		}
 
 		for _, inc := range result.Incidents {
