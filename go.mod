@@ -1,6 +1,6 @@
 module github.com/gxben/opsgenie-exporter
 
-go 1.26.4
+go 1.26.11
 
 require (
 	github.com/opsgenie/opsgenie-go-sdk-v2 v1.2.23
